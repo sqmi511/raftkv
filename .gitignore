@@ -1,0 +1,21 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+coverage.txt
+coverage.html
+
+# Runtime data
+/data/
+*.wal
+*.snap
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
