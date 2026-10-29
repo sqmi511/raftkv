@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package raftkv.v1;
+
+option go_package = "github.com/sqmi511/raftkv/api/proto/kvpb;kvpb";
+
+// KV is the client-facing key-value API.
+service KV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+}
+
+message SetRequest {
+  string key = 1;
+  bytes value = 2;
+  // ttl_millis <= 0 means the key never expires (negative values are rejected).
+  int64 ttl_millis = 3;
+}
+
+message SetResponse {}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+}
