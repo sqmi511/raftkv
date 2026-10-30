@@ -51,9 +51,31 @@ type AppendEntriesReply struct {
 	ConflictIndex uint64
 }
 
+// InstallSnapshotArgs is the InstallSnapshot RPC request: the leader sends
+// its whole snapshot to a follower that needs log entries the leader has
+// already compacted away. Receivers must treat it as read-only.
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          string
+	LastIncludedIndex uint64 // the snapshot replaces all entries up to and including this index
+	LastIncludedTerm  uint64 // term of the entry at LastIncludedIndex
+	Data              []byte // the serialized state machine
+}
+
+// InstallSnapshotReply is the InstallSnapshot RPC response.
+type InstallSnapshotReply struct {
+	Term uint64
+	// Success reports that the follower now holds everything up to
+	// LastIncludedIndex (it installed the snapshot or already had that
+	// much). It is false when the request was rejected or could not be
+	// made durable.
+	Success bool
+}
+
 // Transport sends RPCs to other nodes. Implementations must honour ctx
 // cancellation and return an error if the peer cannot be reached.
 type Transport interface {
 	RequestVote(ctx context.Context, to string, args *RequestVoteArgs) (*RequestVoteReply, error)
 	AppendEntries(ctx context.Context, to string, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	InstallSnapshot(ctx context.Context, to string, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }

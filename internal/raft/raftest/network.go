@@ -102,3 +102,18 @@ func (e endpoint) AppendEntries(ctx context.Context, to string, args *raft.Appen
 	}
 	return reply, nil
 }
+
+func (e endpoint) InstallSnapshot(ctx context.Context, to string, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	node, err := e.nw.route(e.from, to)
+	if err != nil {
+		return nil, err
+	}
+	reply := node.HandleInstallSnapshot(args)
+	if _, err := e.nw.route(to, e.from); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}

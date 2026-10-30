@@ -27,6 +27,13 @@ const (
 	leaderWait    = 20 * time.Second
 )
 
+// Options tunes a test cluster. The zero value gives the defaults.
+type Options struct {
+	// SnapshotThreshold is how many applied entries trigger a snapshot.
+	// 0 selects kv.DefaultSnapshotThreshold.
+	SnapshotThreshold uint64
+}
+
 type node struct {
 	svc    *kv.Service
 	cancel context.CancelFunc
@@ -45,9 +52,15 @@ type Cluster struct {
 	down map[string]bool // isolated or stopped
 }
 
-// NewCluster starts size nodes and returns immediately; use WaitLeader to
-// wait for an election.
+// NewCluster starts size nodes with default options and returns immediately;
+// use WaitLeader to wait for an election.
 func NewCluster(t *testing.T, size int) *Cluster {
+	t.Helper()
+	return NewClusterWith(t, size, Options{})
+}
+
+// NewClusterWith is NewCluster with explicit options.
+func NewClusterWith(t *testing.T, size int, opts Options) *Cluster {
 	t.Helper()
 	c := &Cluster{
 		t:     t,
@@ -73,16 +86,19 @@ func NewCluster(t *testing.T, size int) *Cluster {
 				peers = append(peers, p)
 			}
 		}
-		svc, err := kv.New(kv.Config{Raft: raft.Config{
-			ID:                 addr,
-			Peers:              peers,
-			Transport:          c.net.Transport(addr),
-			Storage:            raft.NewMemStorage(),
-			ElectionTimeoutMin: electionMin,
-			ElectionTimeoutMax: electionMax,
-			HeartbeatInterval:  heartbeat,
-			Seed:               int64(i + 1),
-		}})
+		svc, err := kv.New(kv.Config{
+			SnapshotThreshold: opts.SnapshotThreshold,
+			Raft: raft.Config{
+				ID:                 addr,
+				Peers:              peers,
+				Transport:          c.net.Transport(addr),
+				Storage:            raft.NewMemStorage(),
+				ElectionTimeoutMin: electionMin,
+				ElectionTimeoutMax: electionMax,
+				HeartbeatInterval:  heartbeat,
+				Seed:               int64(i + 1),
+			},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}

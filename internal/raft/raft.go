@@ -1,10 +1,13 @@
 // Package raft implements the Raft consensus algorithm: leader election, log
-// replication, commit tracking, linearizable read confirmation (ReadIndex)
-// and persistence of term, vote and log.
+// replication, commit tracking, linearizable read confirmation (ReadIndex),
+// snapshots with log compaction, and persistence of term, vote, log and
+// snapshot.
 //
 // A Node applies committed entries, in log order, from a single goroutine by
-// calling Config.Apply. Without snapshots the state machine is rebuilt from
-// the persisted log after a restart, so Apply starts again from index 1 and
+// calling Config.Apply. When a snapshot exists (after a restart, or when the
+// leader sends one), Config.Restore is called first with its data, and
+// Apply continues from the entry after it. Without a snapshot the state
+// machine is rebuilt from the persisted log, so Apply starts at index 1 and
 // the state machine must begin empty.
 package raft
 
@@ -54,8 +57,13 @@ var (
 	ErrNotReady = errors.New("raft: leader has not committed an entry in its term yet")
 )
 
-// maxEntriesPerRPC bounds how many log entries one AppendEntries carries.
-const maxEntriesPerRPC = 256
+const (
+	// maxEntriesPerRPC bounds how many log entries one AppendEntries carries.
+	maxEntriesPerRPC = 256
+	// snapshotRPCTimeout bounds one InstallSnapshot RPC. Snapshots are sent
+	// in a single message, so this is far more generous than for heartbeats.
+	snapshotRPCTimeout = 10 * time.Second
+)
 
 // Config configures a Node.
 type Config struct {
@@ -63,14 +71,27 @@ type Config struct {
 	Peers     []string  // IDs of all OTHER nodes
 	Transport Transport // how to reach peers
 
-	// Storage persists term, vote and log. Default: a new MemStorage, which
-	// is not durable across process restarts. The caller owns it: Stop does
-	// not close it.
+	// Storage persists term, vote, log and snapshot. Default: a new
+	// MemStorage, which is not durable across process restarts. The caller
+	// owns it: Stop does not close it.
 	Storage Storage
 	// Apply receives each committed, non-empty entry in log order. It is
 	// called from one goroutine at a time, without any Node lock held, and
 	// must be deterministic. Stop waits for a running Apply call to return.
 	Apply func(Entry)
+
+	// Snapshot serializes the state machine. It is called from the same
+	// goroutine as Apply, between entries, so the state is exactly "everything
+	// applied so far". Required when SnapshotThreshold > 0.
+	Snapshot func() ([]byte, error)
+	// Restore replaces the state machine's entire state with a snapshot
+	// produced by Snapshot (possibly on another node). It is called from the
+	// Apply goroutine. A returned error takes the node out of service.
+	Restore func(data []byte) error
+	// SnapshotThreshold is the number of applied entries after the last
+	// snapshot that triggers a new one. 0 disables snapshotting on this node
+	// (it can still receive and restore snapshots).
+	SnapshotThreshold uint64
 
 	// ElectionTimeoutMin/Max bound the randomized election timeout.
 	// Defaults: 150ms and 300ms.
@@ -105,6 +126,8 @@ func (c *Config) fillAndValidate() error {
 		return fmt.Errorf("%w: need 0 < ElectionTimeoutMin <= ElectionTimeoutMax", ErrInvalidConfig)
 	case c.HeartbeatInterval < 0 || c.HeartbeatInterval >= c.ElectionTimeoutMin:
 		return fmt.Errorf("%w: HeartbeatInterval must be positive and below ElectionTimeoutMin", ErrInvalidConfig)
+	case c.SnapshotThreshold > 0 && c.Snapshot == nil:
+		return fmt.Errorf("%w: SnapshotThreshold needs a Snapshot function", ErrInvalidConfig)
 	}
 
 	seen := map[string]bool{c.ID: true}
@@ -122,47 +145,56 @@ func (c *Config) fillAndValidate() error {
 
 // Status is a consistent snapshot of a node's externally visible state.
 type Status struct {
-	ID          string
-	State       State
-	Term        uint64
-	LeaderID    string // who this node believes is leader in Term ("" if unknown)
-	LastIndex   uint64 // index of the last log entry
-	CommitIndex uint64 // highest index known to be committed
-	Applied     uint64 // highest index handed to Apply
-	Err         error  // non-nil once a storage failure has taken the node out of service
+	ID            string
+	State         State
+	Term          uint64
+	LeaderID      string // who this node believes is leader in Term ("" if unknown)
+	LastIndex     uint64 // index of the last log entry
+	CommitIndex   uint64 // highest index known to be committed
+	Applied       uint64 // highest index handed to Apply (or covered by a restored snapshot)
+	SnapshotIndex uint64 // last index covered by the snapshot (0 = none): the log before it is compacted
+	Err           error  // non-nil once a storage failure has taken the node out of service
 }
 
 // peerProgress is the leader's view of one follower's log.
 type peerProgress struct {
 	next     uint64 // index of the next entry to send
 	match    uint64 // highest index known to be replicated on the follower
-	inflight bool   // an AppendEntries RPC is outstanding
+	inflight bool   // an AppendEntries or InstallSnapshot RPC is outstanding
 	ackSeq   uint64 // newest read sequence number this follower has acknowledged leadership for
 }
 
 // Node is one Raft participant. All methods are safe for concurrent use.
 type Node struct {
-	id          string
-	peers       []string
-	tr          Transport
-	storage     Storage
-	apply       func(Entry)
-	electionMin time.Duration
-	electionMax time.Duration
-	heartbeat   time.Duration
-	logger      *slog.Logger
+	id            string
+	peers         []string
+	tr            Transport
+	storage       Storage
+	apply         func(Entry)
+	snapshotFn    func() ([]byte, error)
+	restoreFn     func([]byte) error
+	snapThreshold uint64
+	electionMin   time.Duration
+	electionMax   time.Duration
+	heartbeat     time.Duration
+	logger        *slog.Logger
 
 	ctx     context.Context
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	applyCh chan struct{} // wakes the applier; buffered so signalling never blocks
 
-	mu               sync.Mutex // guards everything below
-	rng              *rand.Rand
-	state            State
-	term             uint64
+	mu    sync.Mutex // guards everything below
+	rng   *rand.Rand
+	state State
+	term  uint64
+	// log[0] is a sentinel standing for the snapshot: its Index and Term are
+	// the snapshot's last included entry (0, 0 if there is none). Entry i
+	// lives at log[i-log[0].Index].
+	log              []Entry
+	snapshot         Snapshot  // the snapshot log[0] stands for (kept to send to lagging followers)
+	pendingSnap      *Snapshot // a snapshot the apply goroutine must still restore
 	votedFor         string
-	log              []Entry // log[0] is a sentinel; entry i lives at log[i]
 	commitIndex      uint64
 	lastApplied      uint64
 	leaderID         string
@@ -191,10 +223,15 @@ func NewNode(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("raft: load state: %w", err)
 	}
+	snap, err := st.LoadSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("raft: load snapshot: %w", err)
+	}
 	lg := make([]Entry, 1, len(entries)+1)
+	lg[0] = Entry{Index: snap.Index, Term: snap.Term}
 	for i, e := range entries {
-		if e.Index != uint64(i)+1 {
-			return nil, fmt.Errorf("%w: log entry %d has index %d", ErrCorruptStorage, i+1, e.Index)
+		if want := snap.Index + uint64(i) + 1; e.Index != want {
+			return nil, fmt.Errorf("%w: log entry %d has index %d", ErrCorruptStorage, want, e.Index)
 		}
 		lg = append(lg, e)
 	}
@@ -211,25 +248,40 @@ func NewNode(cfg Config) (*Node, error) {
 	if apply == nil {
 		apply = func(Entry) {}
 	}
+	restore := cfg.Restore
+	if restore == nil {
+		restore = func([]byte) error { return nil }
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		id:          cfg.ID,
-		peers:       append([]string(nil), cfg.Peers...),
-		tr:          cfg.Transport,
-		storage:     st,
-		apply:       apply,
-		electionMin: cfg.ElectionTimeoutMin,
-		electionMax: cfg.ElectionTimeoutMax,
-		heartbeat:   cfg.HeartbeatInterval,
-		logger:      logger.With("node", cfg.ID),
-		ctx:         ctx,
-		cancel:      cancel,
-		applyCh:     make(chan struct{}, 1),
-		rng:         rand.New(rand.NewSource(seed)),
-		term:        hs.Term,
-		votedFor:    hs.VotedFor,
-		log:         lg,
+		id:            cfg.ID,
+		peers:         append([]string(nil), cfg.Peers...),
+		tr:            cfg.Transport,
+		storage:       st,
+		apply:         apply,
+		snapshotFn:    cfg.Snapshot,
+		restoreFn:     restore,
+		snapThreshold: cfg.SnapshotThreshold,
+		electionMin:   cfg.ElectionTimeoutMin,
+		electionMax:   cfg.ElectionTimeoutMax,
+		heartbeat:     cfg.HeartbeatInterval,
+		logger:        logger.With("node", cfg.ID),
+		ctx:           ctx,
+		cancel:        cancel,
+		applyCh:       make(chan struct{}, 1),
+		rng:           rand.New(rand.NewSource(seed)),
+		term:          hs.Term,
+		votedFor:      hs.VotedFor,
+		log:           lg,
+		snapshot:      snap,
+	}
+	if snap.Index > 0 {
+		// Everything up to the snapshot is committed. The state machine
+		// still has to be restored from it before entries after it apply.
+		n.commitIndex = snap.Index
+		ps := snap
+		n.pendingSnap = &ps
 	}
 	n.resetElectionTimer()
 	return n, nil
@@ -248,6 +300,9 @@ func (n *Node) Start() {
 	n.wg.Add(2)
 	go n.run()
 	go n.applyLoop()
+	if n.pendingSnap != nil {
+		n.signalApply()
+	}
 }
 
 // Stop halts the node and waits for its goroutines. It is idempotent. A
@@ -270,14 +325,15 @@ func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return Status{
-		ID:          n.id,
-		State:       n.state,
-		Term:        n.term,
-		LeaderID:    n.leaderID,
-		LastIndex:   n.lastIndex(),
-		CommitIndex: n.commitIndex,
-		Applied:     n.lastApplied,
-		Err:         n.failed,
+		ID:            n.id,
+		State:         n.state,
+		Term:          n.term,
+		LeaderID:      n.leaderID,
+		LastIndex:     n.lastIndex(),
+		CommitIndex:   n.commitIndex,
+		Applied:       n.lastApplied,
+		SnapshotIndex: n.snapIndex(),
+		Err:           n.failed,
 	}
 }
 
@@ -367,27 +423,47 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	n.leaderID = args.LeaderID
 	n.resetElectionTimer()
 
+	prevIdx, prevTerm, entries := args.PrevLogIndex, args.PrevLogTerm, args.Entries
+
+	// The RPC may start before our snapshot. Everything the snapshot covers
+	// is committed and identical on the leader, so skip those entries.
+	if si := n.snapIndex(); prevIdx < si {
+		drop := si - prevIdx
+		if drop > uint64(len(entries)) {
+			drop = uint64(len(entries))
+		}
+		if drop > 0 {
+			prevIdx += drop
+			prevTerm = entries[drop-1].Term
+			entries = entries[drop:]
+		}
+		if prevIdx < si {
+			// The RPC ends inside our snapshot: all of it is already here.
+			return &AppendEntriesReply{Term: n.term, Success: true}
+		}
+	}
+
 	// Consistency check: our log must contain the entry the new ones follow.
 	last := n.lastIndex()
-	if args.PrevLogIndex > last {
+	if prevIdx > last {
 		return &AppendEntriesReply{Term: n.term, ConflictIndex: last + 1}
 	}
-	if t := n.termAt(args.PrevLogIndex); t != args.PrevLogTerm {
-		ci := args.PrevLogIndex
+	if t := n.termAt(prevIdx); t != prevTerm {
+		ci := prevIdx
 		for ci > 1 && n.termAt(ci-1) == t {
 			ci--
 		}
 		return &AppendEntriesReply{Term: n.term, ConflictIndex: ci}
 	}
 
-	if !n.storeEntries(args) {
+	if !n.storeEntries(prevIdx, entries) {
 		return &AppendEntriesReply{Term: n.term}
 	}
 
 	// Advance the commit index, but only as far as the entries this RPC
 	// proved to match the leader: our log may hold extra, unverified entries.
 	if args.LeaderCommit > n.commitIndex {
-		lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+		lastNew := prevIdx + uint64(len(entries))
 		c := args.LeaderCommit
 		if lastNew < c {
 			c = lastNew
@@ -398,6 +474,54 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 		}
 	}
 	return &AppendEntriesReply{Term: n.term, Success: true}
+}
+
+// HandleInstallSnapshot processes an incoming InstallSnapshot RPC.
+func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshotReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.down() || args.Term < n.term {
+		return &InstallSnapshotReply{Term: n.term}
+	}
+	if args.Term > n.term || n.state != Follower {
+		n.becomeFollower(args.Term)
+		if n.failed != nil {
+			return &InstallSnapshotReply{Term: n.term}
+		}
+	}
+	n.leaderID = args.LeaderID
+	n.resetElectionTimer()
+
+	idx, term := args.LastIncludedIndex, args.LastIncludedTerm
+	if idx == 0 {
+		return &InstallSnapshotReply{Term: n.term}
+	}
+	if idx <= n.commitIndex {
+		// We already hold (and have committed) everything this covers.
+		return &InstallSnapshotReply{Term: n.term, Success: true}
+	}
+
+	snap := Snapshot{Index: idx, Term: term, Data: append([]byte(nil), args.Data...)}
+	if err := n.storage.SaveSnapshot(snap); err != nil {
+		n.fail(fmt.Errorf("persist snapshot: %w", err))
+		return &InstallSnapshotReply{Term: n.term}
+	}
+
+	// Mirror the storage rule: keep the entries after idx only if our log
+	// agrees with the snapshot at idx.
+	si := n.snapIndex()
+	if idx <= n.lastIndex() && n.termAt(idx) == term {
+		n.log = append([]Entry{{Index: idx, Term: term}}, n.log[idx-si+1:]...)
+	} else {
+		n.log = []Entry{{Index: idx, Term: term}}
+	}
+	n.snapshot = snap
+	n.commitIndex = idx
+	n.pendingSnap = &snap
+	n.signalApply()
+	n.logger.Info("installed snapshot", "index", idx, "term", term)
+	return &InstallSnapshotReply{Term: n.term, Success: true}
 }
 
 // ---- internals (n.mu must be held unless stated otherwise) ----------------
@@ -442,7 +566,8 @@ func (n *Node) tick() {
 	}
 }
 
-// applyLoop hands committed entries to Apply, outside the lock, in order.
+// applyLoop restores snapshots and hands committed entries to Apply, outside
+// the lock, in order. It is the only goroutine that touches the state machine.
 func (n *Node) applyLoop() {
 	defer n.wg.Done()
 
@@ -452,27 +577,107 @@ func (n *Node) applyLoop() {
 			return
 		case <-n.applyCh:
 		}
-		for {
-			n.mu.Lock()
-			if n.down() || n.lastApplied >= n.commitIndex {
-				n.mu.Unlock()
-				break
-			}
-			from, to := n.lastApplied+1, n.commitIndex
-			batch := append([]Entry(nil), n.log[from:to+1]...)
-			n.mu.Unlock()
-
-			for _, e := range batch {
-				if len(e.Data) > 0 { // skip leader no-ops
-					n.apply(e)
-				}
-			}
-
-			n.mu.Lock()
-			n.lastApplied = to
-			n.mu.Unlock()
+		for n.applyPending() {
 		}
 	}
+}
+
+// applyPending does one unit of apply work and reports whether more may remain.
+func (n *Node) applyPending() bool {
+	n.mu.Lock()
+	if n.down() {
+		n.mu.Unlock()
+		return false
+	}
+
+	if snap := n.pendingSnap; snap != nil {
+		n.pendingSnap = nil
+		n.mu.Unlock()
+
+		if err := n.restoreFn(snap.Data); err != nil {
+			n.mu.Lock()
+			n.fail(fmt.Errorf("restore snapshot: %w", err))
+			n.mu.Unlock()
+			return false
+		}
+		n.mu.Lock()
+		if snap.Index > n.lastApplied {
+			n.lastApplied = snap.Index
+		}
+		n.mu.Unlock()
+		return true
+	}
+
+	if n.lastApplied >= n.commitIndex {
+		n.mu.Unlock()
+		return false
+	}
+	si := n.snapIndex()
+	from, to := n.lastApplied+1, n.commitIndex
+	if from <= si {
+		n.fail(fmt.Errorf("%w: entry %d needed for apply is compacted (snapshot at %d)", ErrCorruptStorage, from, si))
+		n.mu.Unlock()
+		return false
+	}
+	batch := append([]Entry(nil), n.log[from-si:to-si+1]...)
+	n.mu.Unlock()
+
+	for _, e := range batch {
+		if len(e.Data) > 0 { // skip leader no-ops
+			n.apply(e)
+		}
+	}
+
+	n.mu.Lock()
+	if to > n.lastApplied {
+		n.lastApplied = to
+	}
+	n.mu.Unlock()
+
+	n.maybeSnapshot()
+	return true
+}
+
+// maybeSnapshot takes a snapshot if enough entries were applied since the
+// last one. It runs on the apply goroutine, so the state machine is exactly
+// at lastApplied while it is serialized.
+func (n *Node) maybeSnapshot() {
+	n.mu.Lock()
+	if n.down() || n.snapThreshold == 0 || n.snapshotFn == nil || n.pendingSnap != nil ||
+		n.lastApplied <= n.snapIndex() || n.lastApplied-n.snapIndex() < n.snapThreshold {
+		n.mu.Unlock()
+		return
+	}
+	index := n.lastApplied
+	n.mu.Unlock()
+
+	data, err := n.snapshotFn()
+	if err != nil {
+		n.logger.Error("snapshot failed; will retry", "err", err)
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	// A snapshot from the leader may have replaced our state meanwhile.
+	if n.down() || n.pendingSnap != nil || index <= n.snapIndex() || index > n.commitIndex {
+		return
+	}
+	n.compact(index, data)
+}
+
+// compact makes data the snapshot at index and drops the log before it.
+func (n *Node) compact(index uint64, data []byte) {
+	si := n.snapIndex()
+	term := n.log[index-si].Term
+	snap := Snapshot{Index: index, Term: term, Data: data}
+	if err := n.storage.SaveSnapshot(snap); err != nil {
+		n.fail(fmt.Errorf("persist snapshot: %w", err))
+		return
+	}
+	n.log = append([]Entry{{Index: index, Term: term}}, n.log[index-si+1:]...)
+	n.snapshot = snap
+	n.logger.Info("log compacted", "snapshot_index", index, "log_entries", len(n.log)-1)
 }
 
 func (n *Node) signalApply() {
@@ -514,20 +719,24 @@ func (n *Node) appendLocal(entries ...Entry) error {
 	return nil
 }
 
-func (n *Node) lastIndex() uint64 { return uint64(len(n.log) - 1) }
+// snapIndex is the last index covered by the snapshot (0 if none).
+func (n *Node) snapIndex() uint64 { return n.log[0].Index }
+
+func (n *Node) lastIndex() uint64 { return n.log[0].Index + uint64(len(n.log)-1) }
 
 func (n *Node) lastLog() (index, term uint64) {
-	index = n.lastIndex()
-	return index, n.log[index].Term
+	return n.lastIndex(), n.log[len(n.log)-1].Term
 }
 
-// termAt returns the term of the entry at index i (0 for the sentinel or an
-// index beyond the log).
+// termAt returns the term of the entry at index i. It returns 0 for an index
+// that is not in the log: beyond its end, or compacted into a snapshot (the
+// snapshot's own last index is still known).
 func (n *Node) termAt(i uint64) uint64 {
-	if i >= uint64(len(n.log)) {
+	si := n.snapIndex()
+	if i < si || i > n.lastIndex() {
 		return 0
 	}
-	return n.log[i].Term
+	return n.log[i-si].Term
 }
 
 func (n *Node) quorum() int { return (len(n.peers)+1)/2 + 1 }
@@ -645,11 +854,18 @@ func (n *Node) broadcast(now time.Time) {
 	}
 }
 
-// replicate sends one AppendEntries to peer unless one is already in flight.
-// When a reply shows more work to do, the reply handler calls it again.
+// replicate sends one AppendEntries (or, if the follower needs entries that
+// were compacted away, one InstallSnapshot) to peer unless an RPC is already
+// in flight. When a reply shows more work to do, the reply handler calls it again.
 func (n *Node) replicate(peer string) {
 	p := n.progress[peer]
 	if p == nil || p.inflight || n.state != Leader || n.down() {
+		return
+	}
+
+	si := n.snapIndex()
+	if p.next <= si {
+		n.sendSnapshot(peer, p)
 		return
 	}
 
@@ -661,7 +877,7 @@ func (n *Node) replicate(peer string) {
 		if end-p.next > maxEntriesPerRPC {
 			end = p.next + maxEntriesPerRPC
 		}
-		entries = append([]Entry(nil), n.log[p.next:end]...)
+		entries = append([]Entry(nil), n.log[p.next-si:end-si]...)
 	}
 	args := &AppendEntriesArgs{
 		Term:         n.term,
@@ -692,6 +908,53 @@ func (n *Node) replicate(peer string) {
 	})
 }
 
+func (n *Node) sendSnapshot(peer string, p *peerProgress) {
+	snap := n.snapshot
+	args := &InstallSnapshotArgs{
+		Term:              n.term,
+		LeaderID:          n.id,
+		LastIncludedIndex: snap.Index,
+		LastIncludedTerm:  snap.Term,
+		Data:              snap.Data, // immutable: shared, never modified
+	}
+	term := n.term
+	seq := n.readSeq
+	p.inflight = true
+
+	n.spawn(func() {
+		ctx, cancel := context.WithTimeout(n.ctx, snapshotRPCTimeout)
+		defer cancel()
+		reply, err := n.tr.InstallSnapshot(ctx, peer, args)
+
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		p.inflight = false
+		if err != nil || n.down() {
+			return
+		}
+		n.handleSnapshotReply(peer, p, term, seq, args, reply)
+	})
+}
+
+func (n *Node) handleSnapshotReply(peer string, p *peerProgress, term, seq uint64, args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if reply.Term > n.term {
+		n.becomeFollower(reply.Term)
+		return
+	}
+	if n.state != Leader || n.term != term || n.progress[peer] != p {
+		return
+	}
+	if !reply.Success {
+		return // retried on the next heartbeat
+	}
+	// The follower accepted us as leader of this term.
+	if seq > p.ackSeq {
+		p.ackSeq = seq
+	}
+	n.completeReads()
+	n.matchAdvanced(peer, p, args.LastIncludedIndex)
+}
+
 func (n *Node) handleAppendReply(peer string, p *peerProgress, term, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Term > n.term {
 		n.becomeFollower(reply.Term)
@@ -713,23 +976,7 @@ func (n *Node) handleAppendReply(peer string, p *peerProgress, term, seq uint64,
 	}
 
 	if reply.Success {
-		match := args.PrevLogIndex + uint64(len(args.Entries))
-		if match > p.match {
-			p.match = match
-		}
-		if p.next < match+1 {
-			p.next = match + 1
-		}
-		if n.advanceCommit() {
-			// Tell followers the new commit index without waiting for the
-			// next heartbeat.
-			for _, other := range n.peers {
-				n.replicate(other)
-			}
-		}
-		if p.next <= n.lastIndex() {
-			n.replicate(peer) // keep sending until the follower has caught up
-		}
+		n.matchAdvanced(peer, p, args.PrevLogIndex+uint64(len(args.Entries)))
 		return
 	}
 
@@ -746,7 +993,28 @@ func (n *Node) handleAppendReply(peer string, p *peerProgress, term, seq uint64,
 		next = 1
 	}
 	p.next = next
-	n.replicate(peer)
+	n.replicate(peer) // sends a snapshot instead if next is now inside the compacted prefix
+}
+
+// matchAdvanced records that peer holds everything up to match, commits what
+// that allows, and keeps sending until the peer has caught up.
+func (n *Node) matchAdvanced(peer string, p *peerProgress, match uint64) {
+	if match > p.match {
+		p.match = match
+	}
+	if p.next < match+1 {
+		p.next = match + 1
+	}
+	if n.advanceCommit() {
+		// Tell followers the new commit index without waiting for the
+		// next heartbeat.
+		for _, other := range n.peers {
+			n.replicate(other)
+		}
+	}
+	if p.next <= n.lastIndex() {
+		n.replicate(peer)
+	}
 }
 
 // advanceCommit moves the commit index to the highest entry of the CURRENT
@@ -772,18 +1040,20 @@ func (n *Node) advanceCommit() bool {
 }
 
 // storeEntries applies the log-update part of AppendEntries: skip entries we
-// already have, truncate on conflict, append the rest. It reports success.
-func (n *Node) storeEntries(args *AppendEntriesArgs) bool {
+// already have, truncate on conflict, append the rest. prevIdx is the index
+// the entries follow (never below our snapshot). It reports success.
+func (n *Node) storeEntries(prevIdx uint64, entries []Entry) bool {
 	last := n.lastIndex()
+	si := n.snapIndex()
 	from := -1
 	var truncateAt uint64
-	for i := range args.Entries {
-		idx := args.PrevLogIndex + 1 + uint64(i)
+	for i := range entries {
+		idx := prevIdx + 1 + uint64(i)
 		if idx > last {
 			from = i
 			break
 		}
-		if n.log[idx].Term != args.Entries[i].Term {
+		if n.log[idx-si].Term != entries[i].Term {
 			truncateAt, from = idx, i
 			break
 		}
@@ -804,15 +1074,15 @@ func (n *Node) storeEntries(args *AppendEntriesArgs) bool {
 			n.fail(fmt.Errorf("persist log truncation: %w", err))
 			return false
 		}
-		n.log = n.log[:truncateAt]
+		n.log = n.log[:truncateAt-si]
 	}
 
-	fresh := make([]Entry, 0, len(args.Entries)-from)
-	for i := from; i < len(args.Entries); i++ {
+	fresh := make([]Entry, 0, len(entries)-from)
+	for i := from; i < len(entries); i++ {
 		fresh = append(fresh, Entry{
-			Index: args.PrevLogIndex + 1 + uint64(i),
-			Term:  args.Entries[i].Term,
-			Data:  args.Entries[i].Data,
+			Index: prevIdx + 1 + uint64(i),
+			Term:  entries[i].Term,
+			Data:  entries[i].Data,
 		})
 	}
 	return n.appendLocal(fresh...) == nil

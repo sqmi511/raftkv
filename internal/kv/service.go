@@ -17,6 +17,10 @@ const (
 	applyPoll           = time.Millisecond      // how often a read re-checks that the state machine caught up
 )
 
+// DefaultSnapshotThreshold is the number of applied entries after which a
+// node snapshots its state and compacts its log.
+const DefaultSnapshotThreshold = 10_000
+
 var (
 	// ErrInvalidRequest is returned for a write without a client ID or with request ID 0.
 	ErrInvalidRequest = errors.New("kv: invalid request")
@@ -48,12 +52,18 @@ func (e *NotLeaderError) Error() string {
 
 // Config configures a Service.
 type Config struct {
-	// Raft configures the underlying consensus node. Apply must be nil: the
-	// service installs its own.
+	// Raft configures the underlying consensus node. Apply, Snapshot,
+	// Restore and SnapshotThreshold must be unset: the service installs its own.
 	Raft raft.Config
 	// MaxSessions bounds how many clients are remembered for deduplication.
 	// <= 0 selects DefaultMaxSessions.
 	MaxSessions int
+	// SnapshotThreshold is how many applied entries trigger a snapshot and
+	// log compaction. 0 selects DefaultSnapshotThreshold.
+	SnapshotThreshold uint64
+	// DisableSnapshots stops this node from creating snapshots, so its log
+	// grows without bound. It can still restore snapshots sent by a leader.
+	DisableSnapshots bool
 }
 
 // Service is one node's replicated key-value service. Writes go through
@@ -83,8 +93,9 @@ type waiter struct {
 
 // New builds a service. Call Start to run it.
 func New(cfg Config) (*Service, error) {
-	if cfg.Raft.Apply != nil {
-		return nil, fmt.Errorf("%w: kv.Config.Raft.Apply must be nil; the service installs its own", raft.ErrInvalidConfig)
+	if cfg.Raft.Apply != nil || cfg.Raft.Snapshot != nil || cfg.Raft.Restore != nil || cfg.Raft.SnapshotThreshold != 0 {
+		return nil, fmt.Errorf("%w: kv.Config.Raft.Apply, Snapshot, Restore and SnapshotThreshold must be unset; the service installs its own",
+			raft.ErrInvalidConfig)
 	}
 	st := store.New()
 	s := &Service{
@@ -95,6 +106,14 @@ func New(cfg Config) (*Service, error) {
 	}
 	rcfg := cfg.Raft
 	rcfg.Apply = s.apply
+	rcfg.Restore = s.machine.Restore
+	if !cfg.DisableSnapshots {
+		rcfg.Snapshot = s.machine.Snapshot
+		rcfg.SnapshotThreshold = cfg.SnapshotThreshold
+		if rcfg.SnapshotThreshold == 0 {
+			rcfg.SnapshotThreshold = DefaultSnapshotThreshold
+		}
+	}
 	node, err := raft.NewNode(rcfg)
 	if err != nil {
 		st.Close()
