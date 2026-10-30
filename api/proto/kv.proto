@@ -5,7 +5,12 @@ package raftkv.v1;
 option go_package = "github.com/sqmi511/raftkv/api/proto/kvpb;kvpb";
 
 // KV is the client-facing key-value API.
+//
+// In a cluster, every call must go to the leader. A node that is not the
+// leader fails the call with UNAVAILABLE and, when it knows where the leader
+// is, a "raftkv-leader" trailer holding the leader's address.
 service KV {
+  // Get is linearizable: it reflects every write acknowledged before it began.
   rpc Get(GetRequest) returns (GetResponse);
   rpc Set(SetRequest) returns (SetResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
@@ -25,12 +30,20 @@ message SetRequest {
   bytes value = 2;
   // ttl_millis <= 0 means the key never expires (negative values are rejected).
   int64 ttl_millis = 3;
+  // client_id + request_id make retries safe: the cluster applies each
+  // (client_id, request_id) pair at most once. A client picks a random
+  // client_id once and increments request_id (starting at 1) for every new
+  // write, reusing the same request_id when it retries that write.
+  string client_id = 4;
+  uint64 request_id = 5;
 }
 
 message SetResponse {}
 
 message DeleteRequest {
   string key = 1;
+  string client_id = 2;
+  uint64 request_id = 3;
 }
 
 message DeleteResponse {

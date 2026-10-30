@@ -1,5 +1,6 @@
 // Package raft implements the Raft consensus algorithm: leader election, log
-// replication, commit tracking and persistence of term, vote and log.
+// replication, commit tracking, linearizable read confirmation (ReadIndex)
+// and persistence of term, vote and log.
 //
 // A Node applies committed entries, in log order, from a single goroutine by
 // calling Config.Apply. Without snapshots the state machine is rebuilt from
@@ -42,12 +43,15 @@ func (s State) String() string {
 var (
 	// ErrInvalidConfig is wrapped by errors returned from NewNode.
 	ErrInvalidConfig = errors.New("raft: invalid config")
-	// ErrNotLeader is returned by Propose on a node that is not the leader.
+	// ErrNotLeader is returned by Propose and ReadIndex on a node that is not the leader.
 	ErrNotLeader = errors.New("raft: not the leader")
 	// ErrEmptyCommand is returned by Propose for an empty command.
 	ErrEmptyCommand = errors.New("raft: empty command")
-	// ErrStopped is returned by Propose after Stop.
+	// ErrStopped is returned after Stop.
 	ErrStopped = errors.New("raft: node stopped")
+	// ErrNotReady is returned by ReadIndex while a new leader has not yet
+	// committed an entry from its own term. Retry in a few milliseconds.
+	ErrNotReady = errors.New("raft: leader has not committed an entry in its term yet")
 )
 
 // maxEntriesPerRPC bounds how many log entries one AppendEntries carries.
@@ -133,6 +137,7 @@ type peerProgress struct {
 	next     uint64 // index of the next entry to send
 	match    uint64 // highest index known to be replicated on the follower
 	inflight bool   // an AppendEntries RPC is outstanding
+	ackSeq   uint64 // newest read sequence number this follower has acknowledged leadership for
 }
 
 // Node is one Raft participant. All methods are safe for concurrent use.
@@ -162,6 +167,9 @@ type Node struct {
 	lastApplied      uint64
 	leaderID         string
 	progress         map[string]*peerProgress // leader only
+	termStart        uint64                   // leader only: index of the no-op appended when this term began
+	readSeq          uint64                   // leader only: number of ReadIndex requests so far
+	reads            []*readRequest           // leader only: reads waiting for a quorum confirmation
 	electionDeadline time.Time
 	nextHeartbeat    time.Time
 	started          bool
@@ -422,7 +430,9 @@ func (n *Node) tick() {
 	}
 	now := time.Now()
 	if n.state == Leader {
-		if !now.Before(n.nextHeartbeat) {
+		// Pending reads need a fresh round of acknowledgements, so they
+		// trigger a broadcast without waiting for the heartbeat deadline.
+		if len(n.reads) > 0 || !now.Before(n.nextHeartbeat) {
 			n.broadcast(now)
 		}
 		return
@@ -481,6 +491,7 @@ func (n *Node) fail(err error) {
 	if n.failed == nil {
 		n.failed = err
 		n.logger.Error("node failed; out of service", "err", err)
+		n.failReads(err)
 	}
 }
 
@@ -531,7 +542,8 @@ func (n *Node) resetElectionTimer() {
 }
 
 // becomeFollower moves to Follower. A higher term clears our vote and leader
-// and is persisted.
+// and is persisted. Reads still waiting for confirmation fail: we can no
+// longer vouch for our leadership.
 func (n *Node) becomeFollower(term uint64) {
 	if n.state != Follower {
 		n.logger.Info("stepping down", "from", n.state.String(), "term", term)
@@ -545,6 +557,7 @@ func (n *Node) becomeFollower(term uint64) {
 	if n.state == Leader {
 		n.resetElectionTimer() // a leader's old deadline is meaningless
 	}
+	n.failReads(ErrNotLeader)
 	n.progress = nil
 	n.state = Follower
 }
@@ -559,6 +572,9 @@ func (n *Node) becomeLeader() {
 	for _, peer := range n.peers {
 		n.progress[peer] = &peerProgress{next: last + 1}
 	}
+	n.termStart = last + 1
+	n.readSeq = 0
+	n.reads = nil
 
 	// A no-op in the new term: once it commits, every earlier entry commits
 	// with it (Raft paper section 5.4.2 / figure 8).
@@ -656,6 +672,9 @@ func (n *Node) replicate(peer string) {
 		LeaderCommit: n.commitIndex,
 	}
 	term := n.term
+	// Any read requested after this point has a higher sequence number, so an
+	// acknowledgement of this RPC can never confirm it.
+	seq := n.readSeq
 	p.inflight = true
 
 	n.spawn(func() {
@@ -669,11 +688,11 @@ func (n *Node) replicate(peer string) {
 		if err != nil || n.down() {
 			return
 		}
-		n.handleAppendReply(peer, p, term, args, reply)
+		n.handleAppendReply(peer, p, term, seq, args, reply)
 	})
 }
 
-func (n *Node) handleAppendReply(peer string, p *peerProgress, term uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (n *Node) handleAppendReply(peer string, p *peerProgress, term, seq uint64, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Term > n.term {
 		n.becomeFollower(reply.Term)
 		return
@@ -681,6 +700,16 @@ func (n *Node) handleAppendReply(peer string, p *peerProgress, term uint64, args
 	// Ignore replies that belong to an earlier leadership of ours.
 	if n.state != Leader || n.term != term || n.progress[peer] != p {
 		return
+	}
+
+	// The follower accepted us as leader of this term (it got past the term
+	// check, whether or not the logs matched), so it confirms any read that
+	// was requested before this RPC was sent.
+	if reply.Success || reply.ConflictIndex > 0 {
+		if seq > p.ackSeq {
+			p.ackSeq = seq
+		}
+		n.completeReads()
 	}
 
 	if reply.Success {

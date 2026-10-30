@@ -29,7 +29,12 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // KV is the client-facing key-value API.
+//
+// In a cluster, every call must go to the leader. A node that is not the
+// leader fails the call with UNAVAILABLE and, when it knows where the leader
+// is, a "raftkv-leader" trailer holding the leader's address.
 type KVClient interface {
+	// Get is linearizable: it reflects every write acknowledged before it began.
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*SetResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
@@ -78,7 +83,12 @@ func (c *kVClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.C
 // for forward compatibility.
 //
 // KV is the client-facing key-value API.
+//
+// In a cluster, every call must go to the leader. A node that is not the
+// leader fails the call with UNAVAILABLE and, when it knows where the leader
+// is, a "raftkv-leader" trailer holding the leader's address.
 type KVServer interface {
+	// Get is linearizable: it reflects every write acknowledged before it began.
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Set(context.Context, *SetRequest) (*SetResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
