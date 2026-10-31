@@ -1,0 +1,21 @@
+# Example config for node 1 of a three-node cluster.
+# Run with:  raftkv-server -config configs/node.example.yaml
+# Any flag on the command line overrides the value here.
+
+listen: 0.0.0.0:7000          # where this node binds
+advertise: node1:7000         # how peers and clients reach it (also its node ID)
+peers:                        # the OTHER nodes' advertise addresses
+  - node2:7000
+  - node3:7000
+
+data-dir: /var/lib/raftkv
+http-addr: 0.0.0.0:8000       # /healthz /readyz /status /metrics ("" disables)
+
+log-level: info               # debug, info, warn, error
+log-format: json              # text or json
+
+snapshot-threshold: 10000     # applied entries between snapshots
+election-timeout-min: 300ms
+election-timeout-max: 600ms
+heartbeat-interval: 100ms
+shutdown-grace: 10s

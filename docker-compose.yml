@@ -1,0 +1,62 @@
+name: raftkv
+
+# Three-node cluster. Nodes reach each other by service name on the compose
+# network, so every node advertises "<name>:7000".
+x-node: &node
+  image: raftkv:local
+  build:
+    context: .
+    args:
+      VERSION: ${VERSION:-dev}
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/healthz"]
+    interval: 5s
+    timeout: 2s
+    retries: 3
+    start_period: 5s
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command:
+      - -listen=0.0.0.0:7000
+      - -advertise=node1:7000
+      - -peers=node2:7000,node3:7000
+      - -http-addr=0.0.0.0:8000
+      - -data-dir=/data
+      - -log-format=json
+    ports: ["7001:7000", "8001:8000"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *node
+    hostname: node2
+    command:
+      - -listen=0.0.0.0:7000
+      - -advertise=node2:7000
+      - -peers=node1:7000,node3:7000
+      - -http-addr=0.0.0.0:8000
+      - -data-dir=/data
+      - -log-format=json
+    ports: ["7002:7000", "8002:8000"]
+    volumes: ["node2-data:/data"]
+
+  node3:
+    <<: *node
+    hostname: node3
+    command:
+      - -listen=0.0.0.0:7000
+      - -advertise=node3:7000
+      - -peers=node1:7000,node2:7000
+      - -http-addr=0.0.0.0:8000
+      - -data-dir=/data
+      - -log-format=json
+    ports: ["7003:7000", "8003:8000"]
+    volumes: ["node3-data:/data"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

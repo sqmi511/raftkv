@@ -1,0 +1,8 @@
+.git
+.github
+bin
+data
+*.wal
+*.snap
+*.test
+coverage.txt
