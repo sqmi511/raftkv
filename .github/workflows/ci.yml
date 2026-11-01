@@ -29,5 +29,24 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test (race detector)
-        run: go test -race -count=1 ./...
+      - name: Test (race detector, includes the chaos tests)
+        run: go test -race -count=1 -timeout 15m ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the compose file
+        run: docker compose config -q
+
+      - name: Build the image
+        run: |
+          GO_VERSION=$(awk '/^go /{print $2}' go.mod)
+          docker build --build-arg GO_VERSION="$GO_VERSION" -t raftkv:ci .
+
+      - name: Smoke test the image
+        run: |
+          docker run --rm --entrypoint raftkv-server raftkv:ci -version
+          docker run --rm --entrypoint raftkv-cli raftkv:ci -version
+          docker run --rm --entrypoint raftkv-dashboard raftkv:ci -version
