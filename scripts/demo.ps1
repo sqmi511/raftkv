@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Live demo of raftkv: start a 3-node cluster, write data, kill the leader,
   keep serving, lose the majority, and recover. Everything runs as hidden
@@ -38,7 +38,7 @@ function Step([string]$text) {
 }
 function Note([string]$text) { Write-Host "    $text" -ForegroundColor DarkGray }
 
-function Cli { & $cli -addr $addrs @args }
+function Rkv { & $cli -addr $addrs @args }
 
 function Get-NodeStatus([int]$i) {
     try { Invoke-RestMethod "http://127.0.0.1:$(8000 + $i)/status" -TimeoutSec 1 } catch { $null }
@@ -131,18 +131,18 @@ try {
 
     Step "Writing 20 keys through the client (it finds the leader by itself)"
     foreach ($n in 1..20) {
-        Cli set "user:$n" "value-$n" | Out-Null
+        Rkv set "user:$n" "value-$n" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "write $n failed" }
     }
     Write-Host "20 writes committed on a majority of nodes"
     Write-Host -NoNewline "get user:7 -> "
-    Cli get user:7
+    Rkv get user:7
 
     $leader = Find-Leader
     Step "Killing the LEADER (node $leader)"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Kill-Node $leader
-    Cli set after-failover "still-works" | Out-Null
+    Rkv set after-failover "still-works" | Out-Null
     $sw.Stop()
     if ($LASTEXITCODE -ne 0) { throw "the write after the failover failed" }
     Write-Host ("A write succeeded {0:N0} ms after the leader died (new election + client retry)" -f $sw.Elapsed.TotalMilliseconds) -ForegroundColor Green
@@ -153,7 +153,7 @@ try {
     Step "Checking that no acknowledged write was lost"
     $ok = 0
     foreach ($n in 1..20) {
-        if ((Cli get "user:$n") -eq "value-$n") { $ok++ }
+        if ((Rkv get "user:$n") -eq "value-$n") { $ok++ }
     }
     Write-Host "$ok / 20 keys read back correctly from the surviving majority" -ForegroundColor Green
 
@@ -169,17 +169,17 @@ try {
     Kill-Node $victim
     Show-Cluster
     Write-Host "Trying to write with only 1 of 3 nodes alive (3 s timeout)..."
-    Cli -timeout 3s set should-fail "no-majority"
+    Rkv -timeout 3s set should-fail "no-majority"
     Write-Host "Refused (exit code $LASTEXITCODE). Raft chooses consistency over availability." -ForegroundColor Yellow
 
     Step "Restarting both nodes: the majority returns and writes work again"
     Start-Node $current
     Start-Node $victim
     Wait-Leader | Out-Null
-    Cli set recovered "yes" | Out-Null
+    Rkv set recovered "yes" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "the write after recovery failed" }
     Write-Host -NoNewline "get after-failover -> "
-    Cli get after-failover
+    Rkv get after-failover
     Show-Cluster
 
     Write-Host ""
