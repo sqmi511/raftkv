@@ -1,7 +1,7 @@
 name: raftkv
 
-# Three-node cluster. Nodes reach each other by service name on the compose
-# network, so every node advertises "<name>:7000".
+# Three-node cluster plus a dashboard. Nodes reach each other by service name
+# on the compose network, so every node advertises "<name>:7000".
 x-node: &node
   image: raftkv:local
   build:
@@ -55,6 +55,19 @@ services:
       - -log-format=json
     ports: ["7003:7000", "8003:8000"]
     volumes: ["node3-data:/data"]
+
+  # Live cluster view at http://127.0.0.1:9000 (published on localhost only:
+  # the dashboard has no authentication). It binds 0.0.0.0 inside the
+  # container, so it logs a non-loopback warning; that is expected here.
+  dashboard:
+    image: raftkv:local
+    entrypoint: ["raftkv-dashboard"]
+    command:
+      - -listen=0.0.0.0:9000
+      - -nodes=http://node1:8000,http://node2:8000,http://node3:8000
+    depends_on: [node1, node2, node3]
+    restart: unless-stopped
+    ports: ["127.0.0.1:9000:9000"]
 
 volumes:
   node1-data:

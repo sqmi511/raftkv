@@ -11,14 +11,15 @@ COPY . .
 ARG VERSION=dev
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags "-s -w -X github.com/sqmi511/raftkv/internal/version.Version=${VERSION}" -o /out/raftkv-server ./cmd/server \
- && go build -trimpath -ldflags "-s -w -X github.com/sqmi511/raftkv/internal/version.Version=${VERSION}" -o /out/raftkv-cli ./cmd/cli
+ && go build -trimpath -ldflags "-s -w -X github.com/sqmi511/raftkv/internal/version.Version=${VERSION}" -o /out/raftkv-cli ./cmd/cli \
+ && go build -trimpath -ldflags "-s -w -X github.com/sqmi511/raftkv/internal/version.Version=${VERSION}" -o /out/raftkv-dashboard ./cmd/dashboard
 
 FROM alpine:3.20
 RUN adduser -D -u 10001 raftkv && mkdir /data && chown raftkv /data
-COPY --from=build /out/raftkv-server /out/raftkv-cli /usr/local/bin/
+COPY --from=build /out/raftkv-server /out/raftkv-cli /out/raftkv-dashboard /usr/local/bin/
 USER raftkv
 VOLUME /data
-# 7000: client + peer gRPC, 8000: health and metrics
-EXPOSE 7000 8000
+# 7000: client + peer gRPC, 8000: health and metrics, 9000: dashboard (dashboard service only)
+EXPOSE 7000 8000 9000
 ENTRYPOINT ["raftkv-server"]
 CMD ["-data-dir=/data"]
